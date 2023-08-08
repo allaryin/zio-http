@@ -16,6 +16,7 @@
 
 package zio.http
 
+import zio.Chunk.ByteArray
 import zio._
 import zio.test.Assertion.equalTo
 import zio.test.TestAspect.{diagnose, nonFlaky, sequential, timeout, withLiveClock}
@@ -206,6 +207,53 @@ object WebSocketSpec extends HttpRunnableSpec {
         result <- queue2.takeAll
       } yield assertTrue(result == Chunk("1", "2", "3", "4", "5"))
     },
+    test("simple binary frames transmit correctly") {
+      val message1 = ByteArray("FOO".getBytes("UTF-8"), 0, 3)
+      val message2 = ByteArray("BAR".getBytes("UTF-8"), 0, 3)
+
+      for {
+        msg <- MessageCollector.make[WebSocketChannelEvent]
+        url <- DynamicServer.wsURL
+        id <- DynamicServer.deploy {
+          Handler.webSocket { channel =>
+            channel.receiveAll {
+              case event@Read(frame) => channel.send(Read(frame)) *> msg.add(event)
+              case event@Unregistered => msg.add(event, true)
+              case event => msg.add(event)
+            }
+          }.toHttpAppWS
+        }
+
+        res <- ZIO.scoped {
+          Handler.webSocket { channel =>
+            channel.receiveAll {
+              case UserEventTriggered(HandshakeComplete) =>
+                channel.send(Read(WebSocketFrame.binary(message1)))
+              case Read(WebSocketFrame.Binary(buf)) =>
+                if (buf == message1) { channel.send(Read(WebSocketFrame.binary(message2))) }
+                else if (buf == message2) { channel.shutdown }
+                else {
+                  throw new RuntimeException("unexpected frame buffer received")
+                }
+              case _ =>
+                ZIO.unit
+            }
+          }.connect(url, Headers(DynamicServer.APP_ID, id)) *> {
+            for {
+              events <- msg.await
+              expected = List(
+                UserEventTriggered(HandshakeComplete),
+                Read(WebSocketFrame.binary(message1)),
+                Read(WebSocketFrame.binary(message2)),
+                Unregistered,
+              )
+            } yield assertTrue(events == expected)
+          }
+        }
+      } yield res
+    },
+    //test("simple continuation frames transmit correctly") { ??? },
+    //test("multiple large frames transmit correctly") { ??? },
   )
 
   override def spec = suite("Server") {
