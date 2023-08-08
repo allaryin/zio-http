@@ -21,7 +21,6 @@ import zio._
 import zio.test.Assertion.equalTo
 import zio.test.TestAspect.{diagnose, nonFlaky, sequential, timeout, withLiveClock}
 import zio.test.{TestClock, assertCompletes, assertTrue, assertZIO, testClock}
-
 import zio.http.ChannelEvent.UserEvent.HandshakeComplete
 import zio.http.ChannelEvent.{Read, Unregistered, UserEvent, UserEventTriggered}
 import zio.http.internal.{DynamicServer, HttpRunnableSpec, severTestLayer}
@@ -233,7 +232,7 @@ object WebSocketSpec extends HttpRunnableSpec {
                 if (buf == message1) { channel.send(Read(WebSocketFrame.binary(message2))) }
                 else if (buf == message2) { channel.shutdown }
                 else {
-                  throw new RuntimeException("unexpected frame buffer received")
+                  ZIO.dieMessage("unexpected frame buffer received")
                 }
               case _ =>
                 ZIO.unit
@@ -252,8 +251,120 @@ object WebSocketSpec extends HttpRunnableSpec {
         }
       } yield res
     },
-    //test("simple continuation frames transmit correctly") { ??? },
-    //test("multiple large frames transmit correctly") { ??? },
+    test("simple continuation frames transmit correctly") {
+      val message1 = ByteArray("FOO".getBytes("UTF-8"), 0, 3)
+      val message2 = ByteArray("BAR".getBytes("UTF-8"), 0, 3)
+
+      for {
+        msg <- MessageCollector.make[WebSocketChannelEvent]
+        url <- DynamicServer.wsURL
+        id <- DynamicServer.deploy {
+          Handler.webSocket { channel =>
+            channel.receiveAll {
+              case event@Read(frame) => channel.send(Read(frame)) *> msg.add(event)
+              case event@Unregistered => msg.add(event, true)
+              case event => msg.add(event)
+            }
+          }.toHttpAppWS
+        }
+
+        res <- ZIO.scoped {
+          Handler.webSocket { channel =>
+            channel.receiveAll {
+              case UserEventTriggered(HandshakeComplete) =>
+                channel.send(Read(WebSocketFrame.Binary(message1, isFinal = false)))
+              case Read(WebSocketFrame.Binary(buf)) =>
+                if (buf == message1) {
+                  channel.send(Read(WebSocketFrame.continuation(message2)))
+                }
+                else {
+                  ZIO.dieMessage("unexpected frame buffer received")
+                }
+              case Read(WebSocketFrame.Continuation(buf)) =>
+                if (buf == message2) {
+                  channel.shutdown
+                  // append together to ensure correct data
+                }
+                else {
+                  ZIO.dieMessage("unexpected frame buffer received")
+                }
+              case _ =>
+                ZIO.unit
+            }
+          }.connect(url, Headers(DynamicServer.APP_ID, id)) *> {
+            for {
+              events <- msg.await
+              expected = List(
+                UserEventTriggered(HandshakeComplete),
+                Read(WebSocketFrame.Binary(message1, isFinal = false)),
+                Read(WebSocketFrame.continuation(message2)),
+                Unregistered,
+              )
+            } yield assertTrue(events == expected)
+          }
+        }
+      } yield res
+    },
+    test("multiple large frames transmit correctly") {
+      val maxFrame = 2 << 15 - 1
+
+      for {
+        message1 <- Random.nextBytes(maxFrame)
+        message2 <- Random.nextBytes(maxFrame)
+        message3 <- Random.nextBytes(2 << 8)
+
+        msg <- MessageCollector.make[WebSocketChannelEvent]
+        url <- DynamicServer.wsURL
+        id <- DynamicServer.deploy {
+          Handler.webSocket { channel =>
+            channel.receiveAll {
+              case event@Read(frame) => channel.send(Read(frame)) *> msg.add(event)
+              case event@Unregistered => msg.add(event, true)
+              case event => msg.add(event)
+            }
+          }.toHttpAppWS
+        }
+
+        res <- ZIO.scoped {
+          Handler.webSocket { channel =>
+            channel.receiveAll {
+              case UserEventTriggered(HandshakeComplete) =>
+                channel.send(Read(WebSocketFrame.Binary(message1, isFinal = false)))
+              case Read(WebSocketFrame.Binary(buf)) =>
+                if (buf == message1) {
+                  channel.send(Read(WebSocketFrame.Continuation(message2, isFinal = false)))
+                }
+                else {
+                  ZIO.dieMessage("unexpected frame buffer received")
+                }
+              case Read(WebSocketFrame.Continuation(buf)) =>
+                if (buf == message2) {
+                  channel.send(Read(WebSocketFrame.Continuation(message3, isFinal = true)))
+                } else if (buf == message3) {
+                  channel.shutdown
+                  // append together to ensure correct data
+                }
+                else {
+                  ZIO.dieMessage("unexpected frame buffer received")
+                }
+              case _ =>
+                ZIO.unit
+            }
+          }.connect(url, Headers(DynamicServer.APP_ID, id)) *> {
+            for {
+              events <- msg.await
+              expected = List(
+                UserEventTriggered(HandshakeComplete),
+                Read(WebSocketFrame.Binary(message1, isFinal = false)),
+                Read(WebSocketFrame.Continuation(message2, isFinal = false)),
+                Read(WebSocketFrame.Continuation(message3, isFinal = true)),
+                Unregistered,
+              )
+            } yield assertTrue(events == expected)
+          }
+        }
+      } yield res
+    },
   )
 
   override def spec = suite("Server") {
